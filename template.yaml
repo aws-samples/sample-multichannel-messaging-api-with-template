@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Multichannel messaging API with template management - REST API Gateway integrated with SQS,
+  Lambda, SES, and SMS for sending templated email and SMS messages with JWT authentication,
+  DynamoDB-backed template storage, and KMS encryption at rest
+
+Parameters:
+  JWTSecret:
+    Type: String
+    Description: "You are responsible for generating and managing a cryptographically secure JWT secret (minimum 32 characters recommended). AWS is responsible for securely storing this secret in AWS Secrets Manager with KMS encryption at rest."
+    NoEcho: true
+    MinLength: 16
+  
+  SESConfigurationSet:
+    Type: String
+    Description: "Optional: SES Configuration Set name for email tracking and analytics"
+    Default: ""
+  
+  SMSConfigurationSet:
+    Type: String
+    Description: "Optional: SMS Configuration Set name for SMS tracking and analytics"
+    Default: ""
+  
+
+Resources:
+##########################################################################
+#   SECRETS MANAGER                                                      #
+##########################################################################
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "CMK for ${AWS::StackName} encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-key"
+      TargetKeyId: !Ref EncryptionKey
+
+  JWTSecretParameter:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub ${AWS::StackName}-jwt-secret
+      Description: JWT secret key for API authentication
+      SecretString: !Ref JWTSecret
+      KmsKeyId: !Ref EncryptionKey
+
+
+##########################################################################
+#   SQS QUEUES                                                           #
+##########################################################################
+  MessagesQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: MessagesQueue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600
+      KmsMasterKeyId: !Ref EncryptionKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MessagesDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  MessagesDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: MessagesDeadLetterQueue
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+      
+##########################################################################
+#   DynamoDB Table for Message Templates                                #
+##########################################################################
+  MessageTemplatesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AWS::StackName}-MessageTemplates
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: TemplateName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TemplateName
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: Message Template Storage
+
+##########################################################################
+#   API GATEWAY ROLE WITH PERMISSIONS TO SEND TO SQS                    #
+##########################################################################
+  ApiGatewaySQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub "/${AWS::StackName}/"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowApiGatewayServiceToAssumeRole
+            Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      ManagedPolicyArns:
+        - !Ref ApiGatewaySQSPolicy
+
+  ApiGatewaySQSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource:
+              - !GetAtt MessagesQueue.Arn
+  
+##########################################################################
+#   REST API GATEWAY                                                     #
+##########################################################################
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub ${AWS::StackName}-api
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: JWTAuthorizer
+      Type: TOKEN
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref apiGateway
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/authorizers/${ApiGatewayAuthorizer}
+
+##########################################################################
+#   API GATEWAY METHOD                                                   #
+##########################################################################
+  apiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewaySQSRole.Arn 
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${MessagesQueue.QueueName}
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        RequestTemplates: 
+          application/json: |
+            Action=SendMessage&MessageBody=$util.urlEncode($input.body)
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates: 
+              application/json: |
+                {
+                  "status": "Message sent to queue"
+                }
+      ResourceId: !GetAtt apiGateway.RootResourceId
+      RestApiId: !Ref apiGateway
+
+##########################################################################
+#   API GATEWAY DEPLOYMENT                                               #
+##########################################################################
+  apiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+      StageName: 'dev'
+
+##########################################################################
+#   LAMBDA FUNCTIONS                                                     #
+##########################################################################
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: JWTAuthorizer
+      CodeUri: lambda/
+      Handler: authorizer.lambda_handler
+      Runtime: python3.12
+      Timeout: 10
+      ReservedConcurrentExecutions: 100
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt AuthorizerDLQ.Arn
+      Environment:
+        Variables:
+          JWT_SECRET_ARN: !Ref JWTSecretParameter
+          JWT_ALGORITHM: HS256
+          JWT_ISSUER: messaging-api
+          JWKS_URL: ""
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref JWTSecretParameter
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+
+  AuthorizerDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-AuthorizerDLQ
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  MessageProcessorDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-MessageProcessorDLQ
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  MessageProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: MessageProcessor
+      CodeUri: lambda/
+      Handler: message_processor.lambda_handler
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 50
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt MessageProcessorDLQ.Arn
+      Environment:
+        Variables:
+          TEMPLATES_TABLE_NAME: !Ref MessageTemplatesTable
+          SES_CONFIGURATION_SET: !Ref SESConfigurationSet
+          SMS_CONFIGURATION_SET: !Ref SMSConfigurationSet
+      Policies:
+        - SESCrudPolicy:
+            IdentityName: "*"
+        - Statement:
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource:
+              - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+        - Statement:
+          - Effect: Allow
+            Action:
+              - sms-voice:SendTextMessage
+            Resource:
+              - !Sub "arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:phone-number/*"
+              - !Sub "arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:pool/*"
+        - DynamoDBReadPolicy:
+            TableName: !Ref MessageTemplatesTable
+        - Statement:
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MessagesQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+##########################################################################
+#   DLQ MONITORING                                                       #
+##########################################################################
+  AlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-alarms
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-DLQ-Messages
+      AlarmDescription: Alert when messages arrive in DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSNSTopic
+      OKActions:
+        - !Ref AlarmSNSTopic
+      InsufficientDataActions:
+        - !Ref AlarmSNSTopic
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MessagesDeadLetterQueue.QueueName
+
+##########################################################################
+#   OUTPUTS                                                              #
+##########################################################################
+Outputs:
+  ApiEndpoint: 
+    Description: "API Gateway endpoint URL for Dev stage"
+    Value: !Sub "https://${apiGateway}.execute-api.${AWS::Region}.${AWS::URLSuffix}/dev/"
+  
+  JWTSecretArn:
+    Description: "ARN of the JWT secret in Secrets Manager"
+    Value: !Ref JWTSecretParameter
+  
+  AuthorizerFunction:
+    Description: "JWT Authorizer Lambda Function ARN"
+    Value: !GetAtt AuthorizerFunction.Arn
+  
+  MessagesQueueUrl:
+    Description: "SQS Queue URL"
+    Value: !Ref MessagesQueue
+    
+  MessagesQueueArn:
+    Description: "SQS Queue ARN"
+    Value: !GetAtt MessagesQueue.Arn
+    
+  DeadLetterQueueUrl:
+    Description: "Dead Letter Queue URL"
+    Value: !Ref MessagesDeadLetterQueue
+    
+  MessageProcessorFunction:
+    Description: "Message Processor Lambda Function ARN"
+    Value: !GetAtt MessageProcessorFunction.Arn
+    
+  MessageTemplatesTableName:
+    Description: "DynamoDB table name for message templates"
+    Value: !Ref MessageTemplatesTable
+
+  AlarmSNSTopicArn:
+    Description: "SNS Topic ARN for alarm notifications - subscribe your email to receive alerts"
+    Value: !Ref AlarmSNSTopic
+
+  EncryptionKeyArn:
+    Description: "KMS key ARN used for encryption"
+    Value: !GetAtt EncryptionKey.Arn
